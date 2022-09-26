@@ -1,0 +1,212 @@
+////
+NO CAMBIAR!!
+Codificación, idioma, tabla de contenidos, tipo de documento
+////
+:encoding: utf-8
+:lang: es
+:toc: right
+:toc-title: Tabla de contenidos
+:doctype: book
+:imagesdir: ./images
+:linkattrs:
+
+////
+Nombre y título del trabajo
+////
+# Configuración de OpenStack Cinder como proveedor de almacenamiento en Kubernetes
+Servicio de las Tecnologías de la Información y las Comunicaciones - Universidad de Almería
+
+image::logocloudstic.png[]
+
+// NO CAMBIAR!! (Entrar en modo no numerado de apartados)
+:numbered!: 
+
+
+[abstract]
+== Resumen
+////
+COLOCA A CONTINUACION EL RESUMEN
+////
+CSI es una especificación para propocionar una interfaz de almacenamiento a contenedores (_Container Storage Interface_), de forma que los fabricantes puedan desarrollar plugins de sus productos. En este tutorial veremos cómo configurar OpenStack Cinder como proveedor de almacenamiento en un cluster de Kubernetes.
+
+
+////
+COLOCA A CONTINUACION LOS OBJETIVOS
+////
+.Objetivos
+* Configurar OpenStack Cinder como backend de almacenamiento en un cluster de Kubernetes.
+* Configurar una clase de almacenamiento Kubernetes (_Storage Class_) para OpenStack Cinder.
+* Crear un volumen de OpenStack Cinder en un cluster Kubernetes
+
+// Entrar en modo numerado de apartados
+:numbered:
+
+## Introducción
+
+CSI (_Container Storage Interface_) define una interfaz de almacenamiento para contenedores. Esta interfaz define un protocolo y una API que proporciona un conjunto de operaciones, como por ejemplo, aprovisionar y liberar volúmenes, o conectar y montar volúmenes, entre otras. Esta interfaz es usada por los fabricantes para implementar drivers para sus sistemas de almacenamiento.
+
+Kubernetes mantiene una https://kubernetes-csi.github.io/docs/drivers.html[lista de drivers CSI] en la que aparecen gran cantidad de proveedores con enlaces para su configuración, como CephFS, Dell EMC, GlusterFS, NetApp, Nutanix, Synology, vSphere, entre otros. 
+
+Si nuestro sistema de almacenamiento no puede ser usado por nuestro cluster de Kubernetes, tendremos que seguir las indicaciones del fabricante para configurar el driver CSI en nuestro cluster de Kubernetes.
+
+
+[NOTE]
+====
+En este tutorial usaremos https://www.rancher.com/[Rancher] para administrar nuestros clusters de Kubernetes. Por tanto, no citamos los proveedores de almacenamiento que incorpora Rancher, como son Amazon EBS Disk, Azure Disk, Azure File, Google Persistent Disk, Longhorn o VMware Sphere Volume.
+====
+
+## Clonar el repositorio de plugins de OpenStack para Kubernetes
+
+Comenzaremos clonando el repositorio de plungins de OpenStack para Kubernetes ejecutando el comando siguiente en una terminal.
+
+`git clone  https://github.com/kubernetes/cloud-provider-openstack.git`
+
+La carpeta `manifests/cinder-csi-plugin` contiene el driver CSI de OpenStack Cinder. En esta carpeta se encuentra un archivo https://gist.github.com/ualmtorres/e9a220b10431c417753dd028aa5fb6af[`csi-secret-cinderplugin.yaml`] que configuraremos más adelante con las credenciales que dan acceso al proyecto OpenStack que proporcionará los volúmenes Cinder.
+
+## Descarga del archivo `.kubeconfig`
+
+Para poder acceder al cluster de Kubernetes desde nuestro cliente `kubectl` tendremos que disponer de las credenciales de acceso al cluster. En Rancher las podemos descargar de dos formas:
+
+* En el menú `Cluster Management`, cada cluster muestra al final unos puntos suspensivos. Pulsar con el botón derecho y seleccionar `Download Kubeconfig`.
+* Si tenemos seleccionado nuestro cluster, la barra de herramientas superior derecha muestra un icono `Download Kubeconfig` para descargar el archivo.
+
+De una forma o de otra, descargar el archivo y colocarlo en una carpeta accesible.
+
+## Preparar las credenciales de acceso al proyecto OpenStack
+
+OpenStack Cinder proporcionará almacenamiento al cluster de Kubernetes a través de un proyecto OpenStack. En esta sección veremos cómo generar la configuración necesaria que pasaremos más adelante a nuestro cluster de Kubernetes.
+
+### Preparar un archivo de credenciales de acceso al proyecto OpenStack
+
+Prepararemos un archivo `cloud.conf` como el siguiente con las credenciales de acceso al proyecto OpenStack que proporcionará los volúmenes al cluster de Kubernetes.
+
+.Archivo `cloud.conf`
+[source, bash]
+----
+[Global]
+username = YOUR_USER
+password = YOUR_PASSWORD
+domain-name = default
+auth-url = https://<openstack-url>:5000/v3
+tenant-id = YOUR_TENANT_ID
+region = YOUR_REGION
+----
+
+[NOTE]
+====
+El valor de `tenant-id` se obtiene en nuestra plataforma OpenStack en el menu `Proyecto | Acceso a la API` y después pulsando en botón `Ver credenciales`.
+
+image::ver-credenciales.png[]
+
+Aparecerá un cuadro de diálogo con las credenciales del usuario en el proyecto, entre ellas `ID del proyecto`.
+
+image::credenciales-usuario.png[]
+====
+
+### Codificar `cloud.conf` en base64
+
+Kubernetes necesita las credenciales de acceso al proyecto de OpenStack en base64. A continuación, codificaremos el contenido de `cloud.conf` en base64 con este comando.
+
+`cat cloud.conf | base64 |tr -d '\n'`
+
+Esto generará un resultado similar a este.
+
+[source, code]
+----
+W0dsb2JhbF0KdXNlcm5hbWUgPSBZT1VSX1VTRVIKcGFzc3dvcmQgPSBZT1VSX1BBU1NXT1JECmRvbWFpbi1uYW1lID0gZGVmYXVsdAphdXRoLXVybCA9IGh0dHBzOi8vWU9VUl9EVV9VUkwva2V5c3RvbmUvdjMKdGVuYW50LWlkID0gWU9VUl9URU5BTlRfSUQKcmVnaW9uID0gWU9VUl9SRUdJT04K
+----
+
+Este valor lo usaremos a continuación para crear un objeto `Secret` en el cluster de Kubernetes que proporcione acceso al proyecto OpenStack.
+
+### Configurar el objeto `Secret` del driver CSI
+
+En este paso configuraremos el objeto `Secret` que desplegaremos más adelante con las credenciales en base64 de `cloud.conf`. Para ello, configuramos el archivo https://gist.github.com/ualmtorres/e9a220b10431c417753dd028aa5fb6af[`manifests/cinder-csi-plugin/csi-secret-cinderplugin.yaml`] sustituyendo el valor predeterminado en la sección `data.cloud.conf` por el valor generado en paso anterior con nuestras credenciales en base64 de nuestro archivo `cloud.conf`.
+
+## Desplegar el driver CSI de Cinder
+
+Una vez modificado el objeto `Secret` del archivo `manifests/cinder-csi-plugin/csi-secret-cinderplugin.yaml` con nuestras credenciales, lo desplegaremos junto al controlador y los plugins con el comando siguiente desde la raíz del repositorio que clonamos en la sección <<Clonar el repositorio de plugins de OpenStack para Kubernetes>>. 
+
+[NOTE]
+====
+Para hacer el despliegue sobre nuestro cluster de Kubernetes, usaremos el archivo `kubeconfig` que descargamos en la sección <<Descarga del archivo `.kubeconfig`>> cuando usemos `kubectl`.
+====
+
+`kubectl --kubeconfig <path-to-downloaded-kubeconfig> apply -f manifests/cinder-csi-plugin/`
+
+Podemos comprobar la evolución del despliegue con el comando siguiente, que muestra los pods con la cadena `csi` en el `namespace kube-system`
+
+[source, code]
+----
+$ kubectl --kubeconfig <path-to-downloaded-kubeconfig> get pods -n kube-system | grep csi
+
+csi-cinder-controllerplugin-86486c7584-gkhc2   6/6     Running     510 (18m ago)   2d16h
+csi-cinder-nodeplugin-4smh4                    3/3     Running     0               2d16h
+csi-cinder-nodeplugin-5tvt9                    3/3     Running     0               2d16h
+csi-cinder-nodeplugin-bch9c                    3/3     Running     0               2d16h
+csi-cinder-nodeplugin-ffhk6                    3/3     Running     0               2d16h
+csi-cinder-nodeplugin-kz7cr                    3/3     Running     0               2d16h
+----
+
+Podemos observar que crea 6 pods para `controller-plugin` y 3 pods del plugin en cada nodo que tenga nuestro cluster de Kubernetes, 5 en caso de este tutorial.
+
+También podemos ver la información del driver CSI en el cluster con el comando siguiente
+
+[source, bash]
+----
+$ kubectl --kubeconfig <path-to-downloaded-kubeconfig> get csidrivers.storage.k8s.io
+
+NAME                       ATTACHREQUIRED   PODINFOONMOUNT   STORAGECAPACITY   TOKENREQUESTS   REQUIRESREPUBLISH   MODES                  AGE
+cinder.csi.openstack.org   true             true             false             <unset>         false               Persistent,Ephemeral   2d16h
+----
+
+## Creación de la clase de almacenamiento para Cinder
+
+Tras instalar el driver CSI de OpenStack Cinder, crearemos una clase de almacenamiento (`StorageClass`) para poder crear los volúmenes Cinder en nuestro cluster de Kubernetes. Basta con ejecutar el comando siguiente, el cual crea una clase de almacenamiento denominada `cinder` en la zona de disponibilidad `nova`.
+
+[source, code]
+----
+kubectl --kubeconfig <path-to-downloaded-kubeconfig> apply -f https://gist.githubusercontent.com/ualmtorres/483b8b4bfb913c4fd6879f2187099063/raw/d8da79057326f0b35f201fc296841c03382ddeb3/cinder-storage-class.yaml
+----
+
+Si se quieren realizar cambios sobre el contenido del archivo de la clase de almacenamiento, descargar el archivo anterior, realizar los cambios deseados y desplegar el archivo local con las cambios introducidos.
+
+.Archivo `StorageClass` para Cinder
+[source, yaml]
+----
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: cinder <1>
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: cinder.csi.openstack.org
+parameters:
+  availability: nova <2>
+----
+<1> Nombre de la clase de almacenamiento
+<2> Zona de disponibilidad para la creación de los volúmenes
+
+Podemos comprobar que la clase de almacenamiento ha sido creada y está disponible para crear volúmenes Cinder.
+
+image::storage-class.png[]
+
+## Creación de un volumen de prueba
+
+Para probar que la instalación del driver CSI de Cinder es correcta, crearemos un volumen de prueba en nuestro proyecto Rancher (`Storage | Persistent Volume Claims | Create`). Crearemos un volumen de 2 GB denominado `alpha-volume` usando la clase `cinder` creada anteriormente.
+
+image::crear-pvc.png[]
+
+Tras unos instantes, el volumen aparecerá creado.
+
+image::pvc-creado.png[]
+
+
+## Conclusiones
+
+De forma predeterminada, Kubernetes no ofrece soporte para todos los sitemas de almacenamiento. CSI (_Container Storage Interface_) es una especificación que permite a los fabricantes crear drivers para ofrecer su almacenamiento a Kubernetes. En este tutorial hemos visto cómo configurar un OpenStack Cinder como proveedor de almacenamiento para un cluster de Kubernetes.
+
+:numbered!: 
+
+## Referencias
+
+https://platform9.com/learn/tutorials/asd[How to Deploy a Cinder Storage Backend for your Kubernetes Cluster using CSI]
